@@ -1,0 +1,179 @@
+// StockSense backend — Supabase Edge Function
+// Deploy with:  supabase functions deploy stocksense-api --no-verify-jwt
+// Secrets it needs (set once with `supabase secrets set`):
+//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  -> auto-injected by Supabase, no action needed
+//   ADMIN_PIN                                -> supabase secrets set ADMIN_PIN=2468
+//
+// The browser never sees the service role key. It only knows this function's
+// URL, and every write request has to pass through the validation below.
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const sb = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+const ADMIN_PIN = Deno.env.get("ADMIN_PIN") || "2468";
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } });
+
+const now = () => new Date().toISOString().slice(0, 16).replace("T", " ");
+
+async function nextLedgerId() {
+  const { data } = await sb.from("ledger").select("id").order("id", { ascending: false }).limit(1);
+  return (data?.[0]?.id ?? 0) + 1;
+}
+async function nextDoc(prefix: string, table: string) {
+  const { count } = await sb.from(table).select("*", { count: "exact", head: true });
+  return `${prefix}-${String(1000 + (count ?? 0) + 1).padStart(4, "0")}`;
+}
+async function getProduct(name: string) {
+  const { data, error } = await sb.from("products").select("*").eq("name", name).single();
+  if (error || !data) throw new Error(`Unknown product: ${name}`);
+  return data;
+}
+async function getProductBySku(sku: string) {
+  const { data, error } = await sb.from("products").select("*").eq("sku", sku).single();
+  if (error || !data) throw new Error(`Unknown product SKU: ${sku}`);
+  return data;
+}
+async function setStock(sku: string, stock: Record<string, number>) {
+  const { error } = await sb.from("products").update({ stock }).eq("sku", sku);
+  if (error) throw error;
+}
+async function ledgerLog(doc: string, type: string, product: string, loc: string, change: number, balance: number) {
+  const id = await nextLedgerId();
+  await sb.from("ledger").insert({ id, date: now(), doc, type, product, loc, change, balance });
+}
+function checkPin(pin: string) {
+  if (pin !== ADMIN_PIN) throw new Error("Incorrect admin PIN");
+}
+
+// ---- snapshot: everything the app needs to render ----
+async function snapshot() {
+  const [products, ledger, receipts, deliveries, transfers, adjustments] = await Promise.all([
+    sb.from("products").select("*"),
+    sb.from("ledger").select("*").order("id"),
+    sb.from("receipts").select("*"),
+    sb.from("deliveries").select("*"),
+    sb.from("transfers").select("*"),
+    sb.from("adjustments").select("*"),
+  ]);
+  return {
+    products: products.data ?? [],
+    ledger: ledger.data ?? [],
+    receipts: receipts.data ?? [],
+    deliveries: deliveries.data ?? [],
+    transfers: transfers.data ?? [],
+    adjustments: adjustments.data ?? [],
+  };
+}
+
+// ---- action handlers: this is the actual business logic ----
+const actions: Record<string, (p: any) => Promise<void>> = {
+  async receipt(p) {
+    const { product, wh, qty, supplier } = p;
+    if (!product || !wh || !qty || qty <= 0) throw new Error("Product, warehouse, and a positive quantity are required.");
+    const prod = await getProduct(product);
+    const stock = { ...prod.stock, [wh]: (prod.stock[wh] || 0) + qty };
+    await setStock(prod.sku, stock);
+    const doc = await nextDoc("REC", "receipts");
+    await sb.from("receipts").insert({ doc, supplier: supplier || "Unnamed Supplier", product, wh, qty, status: "Done" });
+    await ledgerLog(doc, "Receipt", product, wh, qty, stock[wh]);
+  },
+
+  async delivery(p) {
+    const { product, wh, qty, customer } = p;
+    if (!product || !wh || !qty || qty <= 0) throw new Error("Product, warehouse, and a positive quantity are required.");
+    const prod = await getProduct(product);
+    if ((prod.stock[wh] || 0) < qty) throw new Error("Not enough stock at that warehouse to fulfill this delivery.");
+    const stock = { ...prod.stock, [wh]: prod.stock[wh] - qty };
+    await setStock(prod.sku, stock);
+    const doc = await nextDoc("DEL", "deliveries");
+    await sb.from("deliveries").insert({ doc, customer: customer || "Walk-in Customer", product, wh, qty, status: "Done" });
+    await ledgerLog(doc, "Delivery", product, wh, -qty, stock[wh]);
+  },
+
+  async transfer(p) {
+    const { product, from, to, qty } = p;
+    if (!product || !from || !to || from === to || !qty || qty <= 0) throw new Error("Two different locations and a positive quantity are required.");
+    const prod = await getProduct(product);
+    if ((prod.stock[from] || 0) < qty) throw new Error("Not enough stock at the source location.");
+    const stock = { ...prod.stock, [from]: prod.stock[from] - qty, [to]: (prod.stock[to] || 0) + qty };
+    await setStock(prod.sku, stock);
+    const doc = await nextDoc("INT", "transfers");
+    await sb.from("transfers").insert({ doc, product, from, to, qty, status: "Done" });
+    await ledgerLog(doc, "Transfer", product, from, -qty, stock[from]);
+    await ledgerLog(doc, "Transfer", product, to, qty, stock[to]);
+  },
+
+  async adjustment(p) {
+    const { product, wh, counted, reason } = p;
+    if (!product || !wh || counted === undefined || counted === null) throw new Error("Product, location, and a counted quantity are required.");
+    const prod = await getProduct(product);
+    const system = prod.stock[wh] || 0;
+    const diff = counted - system;
+    const stock = { ...prod.stock, [wh]: counted };
+    await setStock(prod.sku, stock);
+    const doc = await nextDoc("ADJ", "adjustments");
+    await sb.from("adjustments").insert({ doc, product, loc: wh, diff, reason: reason || "Recount" });
+    await ledgerLog(doc, "Adjustment", product, wh, diff, counted);
+  },
+
+  async addProduct(p) {
+    const { sku, name, cat, unit, reorder, initialStock } = p;
+    if (!sku || !name) throw new Error("SKU and name are required.");
+    const stock: Record<string, number> = { "Main Warehouse": initialStock || 0 };
+    const { error } = await sb.from("products").insert({ sku, name, cat, unit, reorder: reorder || 10, stock });
+    if (error) throw new Error(error.message);
+  },
+
+  async updateProduct(p) {
+    const { sku, name, cat, unit, reorder, mainWarehouseStock } = p;
+    const prod = await getProductBySku(sku);
+    const stock = { ...prod.stock, "Main Warehouse": mainWarehouseStock };
+    const { error } = await sb.from("products").update({ name, cat, unit, reorder, stock }).eq("sku", sku);
+    if (error) throw new Error(error.message);
+  },
+
+  async deleteProduct(p) {
+    checkPin(p.pin);
+    const { error } = await sb.from("products").delete().eq("sku", p.sku);
+    if (error) throw new Error(error.message);
+  },
+
+  async deleteDoc(p) {
+    checkPin(p.pin);
+    const { doc } = p;
+    const [r, d, t, a] = await Promise.all([
+      sb.from("receipts").select("*").eq("doc", doc).maybeSingle(),
+      sb.from("deliveries").select("*").eq("doc", doc).maybeSingle(),
+      sb.from("transfers").select("*").eq("doc", doc).maybeSingle(),
+      sb.from("adjustments").select("*").eq("doc", doc).maybeSingle(),
+    ]);
+    if (r.data) { const prod = await getProduct(r.data.product); await setStock(prod.sku, { ...prod.stock, [r.data.wh]: (prod.stock[r.data.wh] || 0) - r.data.qty }); }
+    if (d.data) { const prod = await getProduct(d.data.product); await setStock(prod.sku, { ...prod.stock, [d.data.wh]: (prod.stock[d.data.wh] || 0) + d.data.qty }); }
+    if (t.data) { const prod = await getProduct(t.data.product); await setStock(prod.sku, { ...prod.stock, [t.data.from]: (prod.stock[t.data.from] || 0) + t.data.qty, [t.data.to]: (prod.stock[t.data.to] || 0) - t.data.qty }); }
+    if (a.data) { const prod = await getProduct(a.data.product); await setStock(prod.sku, { ...prod.stock, [a.data.loc]: (prod.stock[a.data.loc] || 0) - a.data.diff }); }
+    await Promise.all(["receipts", "deliveries", "transfers", "adjustments", "ledger"].map((tbl) => sb.from(tbl).delete().eq("doc", doc)));
+  },
+};
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  try {
+    const { action, payload } = await req.json();
+    if (action === "snapshot") return json({ ok: true, snapshot: await snapshot() });
+    const handler = actions[action];
+    if (!handler) return json({ ok: false, error: `Unknown action: ${action}` }, 400);
+    await handler(payload || {});
+    return json({ ok: true, snapshot: await snapshot() });
+  } catch (e) {
+    return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 400);
+  }
+});
