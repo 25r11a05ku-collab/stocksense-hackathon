@@ -24,6 +24,10 @@ Inventory Management System
 - JavaScript
 - MySQL
 
+## Hackathon
+
+Odoo x GCET Hyderabad Hackathon 2026
+
 # Status
 
 Project initialization completed.
