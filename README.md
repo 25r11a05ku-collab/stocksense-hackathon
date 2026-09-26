@@ -1,8 +1,29 @@
-Team Members:
+# StockSense
+
+Inventory Management System
+
+# Team Members
+
 - Harika
-- Soumya
 - Mounika
 - Kurra Thirupathi
- 
-Odoo x GCET Hyderabad Hackathon 2026
-Inventory Management System Project
+
+ # Features
+
+- Product Management
+- Inventory Dashboard
+- Receipts
+- Deliveries
+- Transfers
+- Stock Adjustments
+
+ # Tech Stack
+
+- HTML
+- CSS
+- JavaScript
+- MySQL
+
+# Status
+
+Project initialization completed.
